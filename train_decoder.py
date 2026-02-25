@@ -168,6 +168,11 @@ def train(args):
                 (dx_m - dx_d).abs().mean() +
                 (dy_m - dy_d).abs().mean()
             )
+         
+            print(
+                f"mask: {mask_loss.item():.4f} | "
+                f"depth: {depth_loss.item():.4f}"
+            )
 
             loss = mask_loss + args.lambda_depth * depth_loss
 
