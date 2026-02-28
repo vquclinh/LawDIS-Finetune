@@ -10,7 +10,7 @@ from tqdm import tqdm
 import argparse
 import time
 
-from diffusers_lawdis.lawdis.lawdis_macro_pipeline import LawDISMacroPipeline
+from lawdis.lawdis_macro_pipeline import LawDISMacroPipeline
 
 
 # =========================
