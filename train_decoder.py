@@ -104,33 +104,35 @@ def dice_score(pred, target, eps=1e-6):
 def train(args):
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
     print("Device:", device)
 
     pipeline = LawDISMacroPipeline.from_pretrained(args.model_path)
     pipeline = pipeline.to(device)
 
-    # Freeze UNet
+    # ================= Freeze / Unfreeze =================
     for p in pipeline.unet.parameters():
         p.requires_grad = False
 
-    # Freeze encoder
     for p in pipeline.vae.encoder.parameters():
         p.requires_grad = False
 
-    # Train decoder
     for p in pipeline.vae.decoder.parameters():
         p.requires_grad = True
 
     for p in pipeline.vae.post_quant_conv.parameters():
         p.requires_grad = True
 
-    # Dataset
+    pipeline.unet.eval()
+    pipeline.vae.encoder.eval()
+    pipeline.vae.decoder.train()
+    pipeline.vae.post_quant_conv.train()
+
+    # ================= Dataset =================
     train_dataset = SegDataset(args.data_path, "DIS-TR", args.image_size, use_depth=True)
     val_dataset   = SegDataset(args.data_path, "DIS-VD", args.image_size, use_depth=False)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    val_loader   = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+    val_loader   = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
     print(f"Train images: {len(train_dataset)}")
     print(f"Val images  : {len(val_dataset)}")
@@ -150,15 +152,17 @@ def train(args):
 
     best_dice = 0.0
 
+    # ================= Training Loop =================
     for epoch in range(args.epochs):
 
         start_time = time.time()
 
-        # ================= TRAIN =================
-        pipeline.train()
         train_loss = 0
         train_mask_loss = 0
         train_depth_loss = 0
+
+        pipeline.vae.decoder.train()
+        pipeline.vae.post_quant_conv.train()
 
         for batch in tqdm(train_loader, desc=f"Train Epoch {epoch+1}"):
 
@@ -197,8 +201,10 @@ def train(args):
         train_mask_loss /= len(train_loader)
         train_depth_loss /= len(train_loader)
 
-        # ================= VALIDATION =================
-        pipeline.eval()
+        # ================= Validation =================
+        pipeline.vae.decoder.eval()
+        pipeline.vae.post_quant_conv.eval()
+
         val_loss = 0
         val_dice = 0
 
@@ -239,7 +245,6 @@ def train(args):
             os.path.join(args.output_path, f"decoder_epoch_{epoch+1}.pt")
         )
 
-        # Save best model
         if val_dice > best_dice:
             best_dice = val_dice
             torch.save(
