@@ -40,8 +40,6 @@ class SegDataset(Dataset):
             transforms.ToTensor()
         ])
 
-        self.resize_tf = transforms.Resize((image_size, image_size))
-
     def __len__(self):
         return len(self.images)
 
@@ -50,29 +48,32 @@ class SegDataset(Dataset):
         name = self.images[idx]
         base = os.path.splitext(name)[0]
 
-        img_path  = os.path.join(self.image_dir, name)
-        mask_path = os.path.join(self.mask_dir, base + ".png")
+        img  = Image.open(os.path.join(self.image_dir, name)).convert("RGB")
+        mask = Image.open(os.path.join(self.mask_dir, base + ".png")).convert("L")
 
-        img = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")
-
-        img = self.img_tf(img)
+        img  = self.img_tf(img)
         mask = self.mask_tf(mask)
 
         sample = {"image": img, "mask": mask}
 
         if self.use_depth:
-            depth_path = os.path.join(self.depth_dir, base + ".png")
-            depth = Image.open(depth_path)
-            depth = np.array(depth).astype(np.float32)
+            depth = Image.open(
+                os.path.join(self.depth_dir, base + ".png")
+            ).convert("I")
+
+            depth = depth.resize(
+                (self.image_size, self.image_size),
+                Image.BILINEAR
+            )
+
+            depth = np.array(depth, dtype=np.float32)
 
             if depth.max() > 255:
-                depth = depth / 65535.0
+                depth /= 65535.0
             else:
-                depth = depth / 255.0
+                depth /= 255.0
 
             depth = torch.from_numpy(depth).unsqueeze(0)
-            depth = self.resize_tf(depth)
             sample["depth"] = depth
 
         return sample
@@ -131,8 +132,23 @@ def train(args):
     train_dataset = SegDataset(args.data_path, "DIS-TR", args.image_size, use_depth=True)
     val_dataset   = SegDataset(args.data_path, "DIS-VD", args.image_size, use_depth=False)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    val_loader   = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
 
     print(f"Train images: {len(train_dataset)}")
     print(f"Val images  : {len(val_dataset)}")
@@ -144,6 +160,7 @@ def train(args):
     )
 
     bce = nn.BCEWithLogitsLoss()
+    scaler = torch.cuda.amp.GradScaler()
 
     if hasattr(pipeline, "rgb_latent_scale_factor"):
         scale_factor = pipeline.rgb_latent_scale_factor
@@ -173,25 +190,29 @@ def train(args):
             with torch.no_grad():
                 rgb_latent, features = pipeline.encode_rgb(rgb)
 
-            z = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
-            mask_pred = pipeline.vae.decoder(z, features)
-
-            mask_loss = bce(mask_pred, mask_gt)
-
-            prob = torch.sigmoid(mask_pred)
-            dx_m, dy_m = gradient_map(prob)
-            dx_d, dy_d = gradient_map(depth)
-
-            depth_loss = (
-                (dx_m - dx_d).abs().mean() +
-                (dy_m - dy_d).abs().mean()
-            )
-
-            loss = mask_loss + args.lambda_depth * depth_loss
-
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+
+            with torch.cuda.amp.autocast():
+
+               z = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
+               mask_pred = pipeline.vae.decoder(z, features)
+
+               mask_loss = bce(mask_pred, mask_gt)
+
+               prob = torch.sigmoid(mask_pred)
+               dx_m, dy_m = gradient_map(prob)
+               dx_d, dy_d = gradient_map(depth)
+
+               depth_loss = (
+                  (dx_m - dx_d).abs().mean() +
+                  (dy_m - dy_d).abs().mean()
+               )
+
+               loss = mask_loss + args.lambda_depth * depth_loss
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item()
             train_mask_loss += mask_loss.item()
@@ -209,19 +230,21 @@ def train(args):
         val_dice = 0
 
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation"):
+            with torch.cuda.amp.autocast():
 
-                rgb = batch["image"].to(device)
-                mask_gt = batch["mask"].to(device)
+                for batch in tqdm(val_loader, desc="Validation"):
 
-                rgb_latent, features = pipeline.encode_rgb(rgb)
-                z = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
-                mask_pred = pipeline.vae.decoder(z, features)
+                     rgb = batch["image"].to(device)
+                     mask_gt = batch["mask"].to(device)
 
-                loss = bce(mask_pred, mask_gt)
+                     rgb_latent, features = pipeline.encode_rgb(rgb)
+                     z = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
+                     mask_pred = pipeline.vae.decoder(z, features)
 
-                val_loss += loss.item()
-                val_dice += dice_score(mask_pred, mask_gt).item()
+                     loss = bce(mask_pred, mask_gt)
+
+                     val_loss += loss.item()
+                     val_dice += dice_score(mask_pred, mask_gt).item()
 
         val_loss /= len(val_loader)
         val_dice /= len(val_loader)
