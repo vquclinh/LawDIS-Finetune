@@ -179,6 +179,7 @@ def train(args):
     best_dice = 0.0
 
     # ================= Training Loop =================
+    global_step = 0
     for epoch in range(args.epochs):
 
         start_time = time.time()
@@ -222,6 +223,23 @@ def train(args):
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+
+            # Compute grad norm
+            total_norm = 0.0
+            for p in pipeline.vae.decoder.parameters():
+               if p.grad is not None:
+                  param_norm = p.grad.data.norm(2)
+                  total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+
+            wandb.log({
+               "train/loss_step": loss.item(),
+               "train/mask_loss_step": mask_loss.item(),
+               "train/depth_loss_step": depth_loss.item(),
+               "train/grad_norm": total_norm,
+            }, step=global_step)
+
+            global_step += 1
 
             # Compute grad norm
             total_norm = 0.0
@@ -295,14 +313,13 @@ def train(args):
             print("New BEST model saved!\n")
 
         wandb.log({
-           "epoch": epoch + 1,
-           "train_loss": train_loss,
-           "train_mask_loss": train_mask_loss,
-           "train_depth_loss": train_depth_loss,
-           "val_loss": val_loss,
-           "val_dice": val_dice,
-           "best_val_dice": best_dice,
-        })
+            "train/loss_epoch": train_loss,
+            "train/mask_loss_epoch": train_mask_loss,
+            "train/depth_loss_epoch": train_depth_loss,
+            "val/loss": val_loss,
+            "val/dice": val_dice,
+            "val/best_dice": best_dice,
+        }, step=global_step)
 
     wandb.finish()
 
