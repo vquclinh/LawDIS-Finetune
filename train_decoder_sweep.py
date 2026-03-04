@@ -80,7 +80,7 @@ def train_sweep(args, trial, lr, lambda_depth, sweep_epochs=5):
     for epoch in range(sweep_epochs):
 
         print("\n" + "="*60)
-        print(f"🚀 Trial {trial.number} | Epoch {epoch+1}/{sweep_epochs}")
+        print(f"Trial {trial.number} | Epoch {epoch+1}/{sweep_epochs}")
         print("="*60)
 
         pipeline.vae.decoder.train()
