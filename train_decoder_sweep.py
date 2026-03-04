@@ -10,7 +10,6 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from dotenv import load_dotenv
 
-# Import dataset + utils từ file cũ
 from train_decoder import SegDataset, gradient_map, dice_score
 from lawdis.lawdis_macro_pipeline import LawDISMacroPipeline
 
@@ -80,68 +79,133 @@ def train_sweep(args, trial, lr, lambda_depth, sweep_epochs=5):
 
     for epoch in range(sweep_epochs):
 
+        print("\n" + "="*60)
+        print(f"🚀 Trial {trial.number} | Epoch {epoch+1}/{sweep_epochs}")
+        print("="*60)
+
         pipeline.vae.decoder.train()
         pipeline.vae.post_quant_conv.train()
 
-        for batch in train_loader:
+        epoch_loss = 0
+        epoch_mask_loss = 0
+        epoch_depth_loss = 0
 
-            rgb = batch["image"].to(device)
-            mask_gt = batch["mask"].to(device)
-            depth = batch["depth"].to(device)
+        start_time = time.time()
 
-            with torch.no_grad():
-                rgb_latent, features = pipeline.encode_rgb(rgb)
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=True)
 
-            optimizer.zero_grad()
+        for batch_idx, batch in enumerate(progress_bar):
 
-            with torch.cuda.amp.autocast():
+          rgb = batch["image"].to(device)
+          mask_gt = batch["mask"].to(device)
+          depth = batch["depth"].to(device)
 
-                z = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
-                mask_pred = pipeline.vae.decoder(z, features)
+          with torch.no_grad():
+               rgb_latent, features = pipeline.encode_rgb(rgb)
 
-                mask_loss = bce(mask_pred, mask_gt)
+          optimizer.zero_grad()
 
-                prob = torch.sigmoid(mask_pred)
-                dx_m, dy_m = gradient_map(prob)
-                dx_d, dy_d = gradient_map(depth)
+          with torch.cuda.amp.autocast():
 
-                depth_loss = (
-                    (dx_m - dx_d).abs().mean() +
-                    (dy_m - dy_d).abs().mean()
-                )
+               z = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
+               mask_pred = pipeline.vae.decoder(z, features)
 
-                loss = mask_loss + lambda_depth * depth_loss
+               mask_loss = bce(mask_pred, mask_gt)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+               prob = torch.sigmoid(mask_pred)
+               dx_m, dy_m = gradient_map(prob)
+               dx_d, dy_d = gradient_map(depth)
 
+               depth_loss = (
+                  (dx_m - dx_d).abs().mean() +
+                  (dy_m - dy_d).abs().mean()
+               )
+
+               loss = mask_loss + lambda_depth * depth_loss
+
+          scaler.scale(loss).backward()
+
+          # Tính gradient norm (debug cực quan trọng)
+          total_norm = 0
+          for p in pipeline.vae.decoder.parameters():
+               if p.grad is not None:
+                  param_norm = p.grad.data.norm(2)
+                  total_norm += param_norm.item() ** 2
+          total_norm = total_norm ** 0.5
+
+          scaler.step(optimizer)
+          scaler.update()
+
+          # Accumulate
+          epoch_loss += loss.item()
+          epoch_mask_loss += mask_loss.item()
+          epoch_depth_loss += depth_loss.item()
+
+          # Update tqdm
+          progress_bar.set_postfix({
+               "loss": f"{loss.item():.4f}",
+               "mask": f"{mask_loss.item():.4f}",
+               "depth": f"{depth_loss.item():.4f}"
+          })
+
+          # Log per batch để thấy realtime
+          wandb.log({
+               "train_loss": loss.item(),
+               "mask_loss": mask_loss.item(),
+               "depth_loss": depth_loss.item(),
+               "grad_norm": total_norm,
+               "epoch": epoch + 1
+          })
+
+        # =========================
+        # End epoch stats
+        # =========================
+
+        epoch_loss /= len(train_loader)
+        epoch_mask_loss /= len(train_loader)
+        epoch_depth_loss /= len(train_loader)
+
+        elapsed = time.time() - start_time
+        print(f"\n⏱ Epoch time: {elapsed:.2f}s")
+        print(f"   Train Loss: {epoch_loss:.4f}")
+        print(f"   Mask Loss : {epoch_mask_loss:.4f}")
+        print(f"   Depth Loss: {epoch_depth_loss:.4f}")
+
+        # =========================
         # Validation
+        # =========================
+
         pipeline.vae.decoder.eval()
         pipeline.vae.post_quant_conv.eval()
 
         val_dice = 0
         with torch.no_grad():
-            for batch in val_loader:
+           for batch in val_loader:
 
-                rgb = batch["image"].to(device)
-                mask_gt = batch["mask"].to(device)
+               rgb = batch["image"].to(device)
+               mask_gt = batch["mask"].to(device)
 
-                rgb_latent, features = pipeline.encode_rgb(rgb)
-                z = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
-                mask_pred = pipeline.vae.decoder(z, features)
+               rgb_latent, features = pipeline.encode_rgb(rgb)
+               z = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
+               mask_pred = pipeline.vae.decoder(z, features)
 
-                val_dice += dice_score(mask_pred, mask_gt).item()
+               val_dice += dice_score(mask_pred, mask_gt).item()
 
         val_dice /= len(val_loader)
         best_dice = max(best_dice, val_dice)
 
+        print(f"Val Dice: {val_dice:.4f}")
+        print(f"Best Dice: {best_dice:.4f}")
+
+        # Log per epoch
         wandb.log({
-          "epoch": epoch + 1,
-          "val_dice": val_dice,
-          "best_dice_so_far": best_dice,
-          "lr": lr,
-          "lambda_depth": lambda_depth
+           "epoch_train_loss": epoch_loss,
+           "epoch_mask_loss": epoch_mask_loss,
+           "epoch_depth_loss": epoch_depth_loss,
+           "val_dice": val_dice,
+           "best_dice_so_far": best_dice,
+           "learning_rate": lr,
+           "epoch": epoch + 1
         })
     wandb.finish()
     return best_dice
