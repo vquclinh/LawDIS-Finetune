@@ -9,9 +9,12 @@ from PIL import Image
 from tqdm import tqdm
 import argparse
 import time
+import wandb
+from dotenv import load_dotenv
 
 from lawdis.lawdis_macro_pipeline import LawDISMacroPipeline
 
+load_dotenv("/content/drive/MyDrive/lawdis/.env")
 
 # =========================
 # Dataset
@@ -103,7 +106,13 @@ def dice_score(pred, target, eps=1e-6):
 # Training
 # =========================
 def train(args):
-
+    
+    wandb.init(
+        project="lawdis-decoder",
+        name=f"decoder_lr{args.lr}_ld{args.lambda_depth}",
+        config=vars(args)
+    )
+      
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
 
@@ -214,6 +223,14 @@ def train(args):
             scaler.step(optimizer)
             scaler.update()
 
+            # Compute grad norm
+            total_norm = 0.0
+            for p in pipeline.vae.decoder.parameters():
+               if p.grad is not None:
+                  param_norm = p.grad.data.norm(2)
+                  total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+
             train_loss += loss.item()
             train_mask_loss += mask_loss.item()
             train_depth_loss += depth_loss.item()
@@ -274,8 +291,20 @@ def train(args):
                 pipeline.vae.state_dict(),
                 os.path.join(args.output_path, "best_decoder.pt")
             )
-            print("🔥 New BEST model saved!\n")
+            wandb.run.summary["best_val_dice"] = val_dice
+            print("New BEST model saved!\n")
 
+        wandb.log({
+           "epoch": epoch + 1,
+           "train_loss": train_loss,
+           "train_mask_loss": train_mask_loss,
+           "train_depth_loss": train_depth_loss,
+           "val_loss": val_loss,
+           "val_dice": val_dice,
+           "best_val_dice": best_dice,
+        })
+
+    wandb.finish()
 
 # =========================
 # Main
