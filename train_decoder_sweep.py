@@ -2,22 +2,36 @@ import os
 import copy
 import time
 import optuna
+import wandb
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from dotenv import load_dotenv
 
 # Import dataset + utils từ file cũ
 from train_decoder import SegDataset, gradient_map, dice_score
 from lawdis.lawdis_macro_pipeline import LawDISMacroPipeline
 
+load_dotenv("/content/drive/MyDrive/lawdis/.env")
 
 # =========================
 # Train for sweep
 # =========================
-def train_sweep(args, lr, lambda_depth, sweep_epochs=5):
-
+def train_sweep(args, trial, lr, lambda_depth, sweep_epochs=5):
+    
+    wandb.init(
+       project=os.getenv("WANDB_PROJECT"),
+       config={
+          "lr": lr,
+          "lambda_depth": lambda_depth,
+          "batch_size": args.batch_size,
+          "image_size": args.image_size
+       },
+       name=f"trial_{trial.number}",
+       reinit=True
+    )
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     pipeline = LawDISMacroPipeline.from_pretrained(args.model_path)
@@ -122,6 +136,14 @@ def train_sweep(args, lr, lambda_depth, sweep_epochs=5):
         val_dice /= len(val_loader)
         best_dice = max(best_dice, val_dice)
 
+        wandb.log({
+          "epoch": epoch + 1,
+          "val_dice": val_dice,
+          "best_dice_so_far": best_dice,
+          "lr": lr,
+          "lambda_depth": lambda_depth
+        })
+    wandb.finish()
     return best_dice
 
 
@@ -133,9 +155,9 @@ def objective(trial):
     lr = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
     lambda_depth = trial.suggest_float("lambda_depth", 0.05, 1.0)
 
-    print(f"\nTrial: lr={lr:.6f}, lambda_depth={lambda_depth:.4f}")
+    print(f"\nTrial {trial.number}: lr={lr:.6f}, lambda_depth={lambda_depth:.4f}")
 
-    best_dice = train_sweep(args, lr, lambda_depth, sweep_epochs=5)
+    best_dice = train_sweep(args, trial, lr, lambda_depth, sweep_epochs=5)
 
     return best_dice
 

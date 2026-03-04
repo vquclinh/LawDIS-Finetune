@@ -16,3 +16,5 @@ wandb
 scikit-learn
 xformers==0.0.28
 optuna==3.6.1
+wandb
+python-dotenv
