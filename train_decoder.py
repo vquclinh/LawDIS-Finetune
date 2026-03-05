@@ -66,7 +66,7 @@ class SegDataset(Dataset):
 
             depth = depth.resize(
                 (self.image_size, self.image_size),
-                Image.BILINEAR
+                Image.Resampling.BILINEAR
             )
 
             depth = np.array(depth, dtype=np.float32)
@@ -309,7 +309,8 @@ def train(args):
                 pipeline.vae.state_dict(),
                 os.path.join(args.output_path, "best_decoder.pt")
             )
-            wandb.run.summary["best_val_dice"] = val_dice
+            if wandb.run is not None:
+               wandb.run.summary["best_val_dice"] = val_dice
             print("New BEST model saved!\n")
 
         wandb.log({
