@@ -14,7 +14,10 @@ from dotenv import load_dotenv
 
 from lawdis.lawdis_macro_pipeline import LawDISMacroPipeline
 
+Image.MAX_IMAGE_PIXELS = None
+
 load_dotenv("/content/drive/MyDrive/lawdis/.env")
+
 
 # =========================
 # Dataset
@@ -29,7 +32,7 @@ class SegDataset(Dataset):
         if use_depth:
             self.depth_dir = os.path.join(root_dir, "depths", "DIS-TR")
 
-        self.images = sorted(os.listdir(self.image_dir))
+        self.images     = sorted(os.listdir(self.image_dir))
         self.image_size = image_size
 
         self.img_tf = transforms.Compose([
@@ -37,7 +40,6 @@ class SegDataset(Dataset):
             transforms.ToTensor(),
             transforms.Normalize([0.5]*3, [0.5]*3)
         ])
-
         self.mask_tf = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor()
@@ -47,39 +49,52 @@ class SegDataset(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
+        try:
+            name = self.images[idx]
+            base = os.path.splitext(name)[0]
 
-        name = self.images[idx]
-        base = os.path.splitext(name)[0]
+            img = Image.open(os.path.join(self.image_dir, name))
+            img.draft('RGB', (self.image_size, self.image_size))
+            img = img.convert("RGB")
 
-        img  = Image.open(os.path.join(self.image_dir, name)).convert("RGB")
-        mask = Image.open(os.path.join(self.mask_dir, base + ".png")).convert("L")
+            mask = Image.open(os.path.join(self.mask_dir, base + ".png")).convert("L")
 
-        img  = self.img_tf(img)
-        mask = self.mask_tf(mask)
+            img  = self.img_tf(img)
+            mask = self.mask_tf(mask)
 
-        sample = {"image": img, "mask": mask}
+            sample = {"image": img, "mask": mask}
 
-        if self.use_depth:
-            depth = Image.open(
-                os.path.join(self.depth_dir, base + ".png")
-            ).convert("I")
+            if self.use_depth:
+                depth = Image.open(
+                    os.path.join(self.depth_dir, base + ".png")
+                ).convert("I")
+                depth = depth.resize(
+                    (self.image_size, self.image_size),
+                    Image.Resampling.BILINEAR
+                )
+                depth = np.array(depth, dtype=np.float32)
+                if depth.max() > 255:
+                    depth /= 65535.0
+                else:
+                    depth /= 255.0
+                depth = torch.from_numpy(depth).unsqueeze(0)
+                sample["depth"] = depth
 
-            depth = depth.resize(
-                (self.image_size, self.image_size),
-                Image.Resampling.BILINEAR
-            )
+            return sample
 
-            depth = np.array(depth, dtype=np.float32)
+        except Exception as e:
+            print(f"⚠️ Skipping image {self.images[idx]}: {e}")
+            return None
 
-            if depth.max() > 255:
-                depth /= 65535.0
-            else:
-                depth /= 255.0
 
-            depth = torch.from_numpy(depth).unsqueeze(0)
-            sample["depth"] = depth
-
-        return sample
+# =========================
+# Safe Collate
+# =========================
+def safe_collate(batch):
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return None
+    return torch.utils.data.dataloader.default_collate(batch)
 
 
 # =========================
@@ -91,28 +106,46 @@ def gradient_map(x):
     return dx, dy
 
 
+# [FIX] Soft Dice — not use hard threshold (pred > 0.5)
 def dice_score(pred, target, eps=1e-6):
-    pred = torch.sigmoid(pred)
-    pred = (pred > 0.5).float()
+    pred         = torch.sigmoid(pred)
+    intersection = (pred * target).sum(dim=(1, 2, 3))
+    union        = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+    return ((2 * intersection + eps) / (union + eps)).mean()
 
-    intersection = (pred * target).sum(dim=(1,2,3))
-    union = pred.sum(dim=(1,2,3)) + target.sum(dim=(1,2,3))
 
-    dice = (2 * intersection + eps) / (union + eps)
-    return dice.mean()
+# =========================
+# Sanitization helpers
+# =========================
+def sanitize_features(rgb_latent, features, latent_clamp=4.0, feat_clamp=10.0):
+    rgb_latent = torch.nan_to_num(rgb_latent, nan=0.0,
+                                  posinf=latent_clamp, neginf=-latent_clamp)
+    rgb_latent = torch.clamp(rgb_latent, -latent_clamp, latent_clamp)
+
+    clean = []
+    for f in features:
+        f = torch.nan_to_num(f, nan=0.0, posinf=feat_clamp, neginf=-feat_clamp)
+        f = torch.clamp(f, -feat_clamp, feat_clamp)
+        clean.append(f)
+    return rgb_latent, clean
+
+def sanitize_logit(t, clamp_val=10.0):
+    t = torch.nan_to_num(t, nan=-clamp_val, posinf=clamp_val, neginf=-clamp_val)
+    t = torch.clamp(t, -clamp_val, clamp_val)
+    return t
 
 
 # =========================
 # Training
 # =========================
 def train(args):
-    
+
     wandb.init(
         project="lawdis-decoder",
         name=f"decoder_lr{args.lr}_ld{args.lambda_depth}",
         config=vars(args)
     )
-      
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
 
@@ -122,13 +155,10 @@ def train(args):
     # ================= Freeze / Unfreeze =================
     for p in pipeline.unet.parameters():
         p.requires_grad = False
-
     for p in pipeline.vae.encoder.parameters():
         p.requires_grad = False
-
     for p in pipeline.vae.decoder.parameters():
         p.requires_grad = True
-
     for p in pipeline.vae.post_quant_conv.parameters():
         p.requires_grad = True
 
@@ -142,21 +172,14 @@ def train(args):
     val_dataset   = SegDataset(args.data_path, "DIS-VD", args.image_size, use_depth=False)
 
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True,
-        persistent_workers=True
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=2, pin_memory=True, persistent_workers=True,
+        collate_fn=safe_collate
     )
-
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-        persistent_workers=True
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=2, pin_memory=True, persistent_workers=True,
+        collate_fn=safe_collate
     )
 
     print(f"Train images: {len(train_dataset)}")
@@ -169,120 +192,148 @@ def train(args):
     )
 
     bce = nn.BCEWithLogitsLoss()
-    scaler = torch.cuda.amp.GradScaler()
+
+    AMP_DTYPE = torch.bfloat16
 
     if hasattr(pipeline, "rgb_latent_scale_factor"):
         scale_factor = pipeline.rgb_latent_scale_factor
     else:
         scale_factor = pipeline.vae.config.scaling_factor
 
-    best_dice = 0.0
+    best_dice   = 0.0
+    global_step = 0
 
     # ================= Training Loop =================
-    global_step = 0
     for epoch in range(args.epochs):
 
         start_time = time.time()
 
-        train_loss = 0
-        train_mask_loss = 0
-        train_depth_loss = 0
+        train_loss       = 0.0
+        train_mask_loss  = 0.0
+        train_depth_loss = 0.0
+        n_batches        = 0
+        n_skipped        = 0
 
         pipeline.vae.decoder.train()
         pipeline.vae.post_quant_conv.train()
 
         for batch in tqdm(train_loader, desc=f"Train Epoch {epoch+1}"):
 
-            rgb = batch["image"].to(device)
+            if batch is None:
+                continue
+
+            rgb     = batch["image"].to(device)
             mask_gt = batch["mask"].to(device)
-            depth = batch["depth"].to(device)
+            depth   = batch["depth"].to(device)
 
             with torch.no_grad():
                 rgb_latent, features = pipeline.encode_rgb(rgb)
 
+            rgb_latent, features = sanitize_features(rgb_latent, features)
+
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda', dtype=AMP_DTYPE):
 
-               z = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
-               mask_pred = pipeline.vae.decoder(z, features)
+                z         = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
+                mask_pred = pipeline.vae.decoder(z, features)
+                mask_pred = sanitize_logit(mask_pred)   # nan → -10.0
 
-               mask_loss = bce(mask_pred, mask_gt)
+                mask_loss = bce(mask_pred, mask_gt)
 
-               prob = torch.sigmoid(mask_pred)
-               dx_m, dy_m = gradient_map(prob)
-               dx_d, dy_d = gradient_map(depth)
+                prob  = torch.sigmoid(mask_pred).clamp(1e-6, 1 - 1e-6)
 
-               depth_loss = (
-                  (dx_m - dx_d).abs().mean() +
-                  (dy_m - dy_d).abs().mean()
-               )
+                depth = depth.float()
+                depth = depth - depth.amin(dim=(-2, -1), keepdim=True)
+                depth = depth / (depth.amax(dim=(-2, -1), keepdim=True) + 1e-8)
 
-               loss = mask_loss + args.lambda_depth * depth_loss
+                dx_m, dy_m = gradient_map(prob)
+                dx_d, dy_d = gradient_map(depth)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                depth_loss = (
+                    (dx_m - dx_d).abs().mean() +
+                    (dy_m - dy_d).abs().mean()
+                )
+                depth_loss = torch.clamp(depth_loss, 0.0, 10.0)
 
-            # Compute grad norm
+                loss = mask_loss + args.lambda_depth * depth_loss
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"⚠️  NaN/Inf tại step {global_step} | "
+                      f"mask={mask_loss.item():.4f} | depth={depth_loss.item():.4f}")
+                optimizer.zero_grad()
+                n_skipped += 1
+                continue
+
+            # Not use scaler.scale(loss).backward()
+            # bf16 not need loss scaling → backward 
+            loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(
+                list(pipeline.vae.decoder.parameters()) +
+                list(pipeline.vae.post_quant_conv.parameters()),
+                max_norm=1.0
+            )
+
             total_norm = 0.0
-            for p in pipeline.vae.decoder.parameters():
-               if p.grad is not None:
-                  param_norm = p.grad.data.norm(2)
-                  total_norm += param_norm.item() ** 2
+            for p in (list(pipeline.vae.decoder.parameters()) +
+                      list(pipeline.vae.post_quant_conv.parameters())):
+                if p.grad is not None:
+                    total_norm += p.grad.data.norm(2).item() ** 2
             total_norm = total_norm ** 0.5
+
+            optimizer.step()
 
             wandb.log({
-               "train/loss_step": loss.item(),
-               "train/mask_loss_step": mask_loss.item(),
-               "train/depth_loss_step": depth_loss.item(),
-               "train/grad_norm": total_norm,
+                "train/loss_step":       loss.item(),
+                "train/mask_loss_step":  mask_loss.item(),
+                "train/depth_loss_step": depth_loss.item(),
+                "train/grad_norm":       total_norm,
             }, step=global_step)
 
-            global_step += 1
-
-            # Compute grad norm
-            total_norm = 0.0
-            for p in pipeline.vae.decoder.parameters():
-               if p.grad is not None:
-                  param_norm = p.grad.data.norm(2)
-                  total_norm += param_norm.item() ** 2
-            total_norm = total_norm ** 0.5
-
-            train_loss += loss.item()
-            train_mask_loss += mask_loss.item()
+            global_step      += 1
+            train_loss       += loss.item()
+            train_mask_loss  += mask_loss.item()
             train_depth_loss += depth_loss.item()
+            n_batches        += 1
 
-        train_loss /= len(train_loader)
-        train_mask_loss /= len(train_loader)
-        train_depth_loss /= len(train_loader)
+        if n_batches > 0:
+            train_loss       /= n_batches
+            train_mask_loss  /= n_batches
+            train_depth_loss /= n_batches
 
         # ================= Validation =================
         pipeline.vae.decoder.eval()
         pipeline.vae.post_quant_conv.eval()
 
-        val_loss = 0
-        val_dice = 0
+        val_loss      = 0.0
+        val_dice      = 0.0
+        n_val_batches = 0
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast():
-
+            with torch.amp.autocast('cuda', dtype=AMP_DTYPE):
                 for batch in tqdm(val_loader, desc="Validation"):
 
-                     rgb = batch["image"].to(device)
-                     mask_gt = batch["mask"].to(device)
+                    if batch is None:
+                        continue
 
-                     rgb_latent, features = pipeline.encode_rgb(rgb)
-                     z = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
-                     mask_pred = pipeline.vae.decoder(z, features)
+                    rgb     = batch["image"].to(device)
+                    mask_gt = batch["mask"].to(device)
 
-                     loss = bce(mask_pred, mask_gt)
+                    rgb_latent, features = pipeline.encode_rgb(rgb)
+                    rgb_latent, features = sanitize_features(rgb_latent, features)
 
-                     val_loss += loss.item()
-                     val_dice += dice_score(mask_pred, mask_gt).item()
+                    z         = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
+                    mask_pred = pipeline.vae.decoder(z, features)
+                    mask_pred = sanitize_logit(mask_pred)
 
-        val_loss /= len(val_loader)
-        val_dice /= len(val_loader)
+                    val_loss += bce(mask_pred, mask_gt).item()
+                    val_dice += dice_score(mask_pred, mask_gt).item()
+                    n_val_batches += 1
+
+        if n_val_batches > 0:
+            val_loss /= n_val_batches
+            val_dice /= n_val_batches
 
         epoch_time = time.time() - start_time
 
@@ -295,9 +346,9 @@ def train(args):
         print(f"Val Loss       : {val_loss:.6f}")
         print(f"Val Dice       : {val_dice:.6f}")
         print(f"Best Val Dice  : {best_dice:.6f}")
+        print(f"Skipped batches: {n_skipped}")
         print("==============================\n")
 
-        # Save every epoch
         torch.save(
             pipeline.vae.state_dict(),
             os.path.join(args.output_path, f"decoder_epoch_{epoch+1}.pt")
@@ -310,19 +361,21 @@ def train(args):
                 os.path.join(args.output_path, "best_decoder.pt")
             )
             if wandb.run is not None:
-               wandb.run.summary["best_val_dice"] = val_dice
+                wandb.run.summary["best_val_dice"] = val_dice
             print("New BEST model saved!\n")
 
         wandb.log({
-            "train/loss_epoch": train_loss,
-            "train/mask_loss_epoch": train_mask_loss,
+            "train/loss_epoch":       train_loss,
+            "train/mask_loss_epoch":  train_mask_loss,
             "train/depth_loss_epoch": train_depth_loss,
-            "val/loss": val_loss,
-            "val/dice": val_dice,
-            "val/best_dice": best_dice,
+            "val/loss":               val_loss,
+            "val/dice":               val_dice,
+            "val/best_dice":          best_dice,
+            "train/skipped_batches":  n_skipped,
         }, step=global_step)
 
     wandb.finish()
+
 
 # =========================
 # Main
@@ -330,18 +383,15 @@ def train(args):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-
-    parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--output_path", type=str, default="./checkpoints")
-    parser.add_argument("--image_size", type=int, default=512)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--model_path",   type=str,   required=True)
+    parser.add_argument("--data_path",    type=str,   required=True)
+    parser.add_argument("--output_path",  type=str,   default="./checkpoints")
+    parser.add_argument("--image_size",   type=int,   default=512)
+    parser.add_argument("--batch_size",   type=int,   default=4)
+    parser.add_argument("--epochs",       type=int,   default=20)
+    parser.add_argument("--lr",           type=float, default=1e-4)
     parser.add_argument("--lambda_depth", type=float, default=0.3)
 
     args = parser.parse_args()
-
     os.makedirs(args.output_path, exist_ok=True)
-
     train(args)
