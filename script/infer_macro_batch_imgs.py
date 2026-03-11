@@ -83,6 +83,12 @@ if "__main__" == __name__:
         default=0,
         help="Inference batch size. Default: 0 (will be set automatically).",
     )
+    parser.add_argument(
+        "--vae_checkpoint",
+        type=str,
+        default=None,
+        help="Path to finetuned VAE checkpoint (.pt file).",
+    )
 
     args = parser.parse_args()
     checkpoint_path = args.checkpoint
@@ -143,8 +149,14 @@ if "__main__" == __name__:
         checkpoint_path, variant=variant, torch_dtype=dtype
     )
 
+    if args.vae_checkpoint:
+        state_dict = torch.load(args.vae_checkpoint, map_location=device)
+        pipe.vae.load_state_dict(state_dict)
+        pipe.vae.eval()
+        print(f"Loaded VAE checkpoint: {args.vae_checkpoint}")
+
     try:
-        pipe.enable_xformers_memory_efficient_attention()
+      #   pipe.enable_xformers_memory_efficient_attention()
         print("enable_xformers_memory_efficient_attention")
     except ImportError:
         pass  # run without xformers

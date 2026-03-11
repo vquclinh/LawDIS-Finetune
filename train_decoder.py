@@ -158,6 +158,11 @@ def train(args):
         pipeline.vae.load_state_dict(state_dict)
         print(f"Resumed from epoch {args.resume_epoch}: {resume_path}")
 
+    original_params = {
+        name: param.clone().detach()
+        for name, param in pipeline.vae.decoder.named_parameters()
+    }
+
     # ================= Freeze / Unfreeze =================
     for p in pipeline.unet.parameters():
         p.requires_grad = False
@@ -216,7 +221,7 @@ def train(args):
 
         train_loss       = 0.0
         train_mask_loss  = 0.0
-        train_depth_loss = 0.0
+        train_reg_loss = 0.0
         n_batches        = 0
         n_skipped        = 0
 
@@ -240,33 +245,36 @@ def train(args):
             optimizer.zero_grad()
 
             with torch.amp.autocast('cuda', dtype=AMP_DTYPE):
-
                 z         = pipeline.vae.post_quant_conv(rgb_latent / scale_factor)
                 mask_pred = pipeline.vae.decoder(z, features)
-                mask_pred = sanitize_logit(mask_pred)   # nan → -10.0
+                mask_pred = sanitize_logit(mask_pred)
 
-                mask_loss = bce(mask_pred, mask_gt)
+                depth_n = depth.float()
+                depth_n = depth_n - depth_n.amin(dim=(-2,-1), keepdim=True)
+                depth_n = depth_n / (depth_n.amax(dim=(-2,-1), keepdim=True) + 1e-8)
 
-                prob  = torch.sigmoid(mask_pred).clamp(1e-6, 1 - 1e-6)
+                dx_d, dy_d = gradient_map(depth_n)
+                dx_d = torch.nn.functional.pad(dx_d, (0, 1, 0, 0))
+                dy_d = torch.nn.functional.pad(dy_d, (0, 0, 0, 1))
+                boundary_map = (dx_d.abs() + dy_d.abs())
+                boundary_map = boundary_map / (boundary_map.amax(dim=(-2,-1), keepdim=True) + 1e-8)
+                weight = 1.0 + args.lambda_depth * boundary_map
 
-                depth = depth.float()
-                depth = depth - depth.amin(dim=(-2, -1), keepdim=True)
-                depth = depth / (depth.amax(dim=(-2, -1), keepdim=True) + 1e-8)
-
-                dx_m, dy_m = gradient_map(prob)
-                dx_d, dy_d = gradient_map(depth)
-
-                depth_loss = (
-                    (dx_m - dx_d).abs().mean() +
-                    (dy_m - dy_d).abs().mean()
+                mask_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                    mask_pred, mask_gt, weight=weight.to(mask_pred.dtype)
                 )
-                depth_loss = torch.clamp(depth_loss, 0.0, 10.0)
 
-                loss = mask_loss + args.lambda_depth * depth_loss
+                reg_loss = torch.stack([
+                    (p - original_params[n].to(p.dtype)).pow(2).mean()
+                    for n, p in pipeline.vae.decoder.named_parameters()
+                ]).sum()
+                reg_loss = torch.clamp(reg_loss, 0.0, 10.0)
+
+                loss = mask_loss + args.lambda_reg * reg_loss
 
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"⚠️  NaN/Inf tại step {global_step} | "
-                      f"mask={mask_loss.item():.4f} | depth={depth_loss.item():.4f}")
+                      f"mask={mask_loss.item():.4f} | reg={reg_loss.item():.4f}")
                 optimizer.zero_grad()
                 n_skipped += 1
                 continue
@@ -293,20 +301,20 @@ def train(args):
             wandb.log({
                 "train/loss_step":       loss.item(),
                 "train/mask_loss_step":  mask_loss.item(),
-                "train/depth_loss_step": depth_loss.item(),
+                "train/reg_loss_step":   reg_loss.item(),
                 "train/grad_norm":       total_norm,
             }, step=global_step)
 
             global_step      += 1
             train_loss       += loss.item()
             train_mask_loss  += mask_loss.item()
-            train_depth_loss += depth_loss.item()
+            train_reg_loss   += reg_loss.item()
             n_batches        += 1
 
         if n_batches > 0:
             train_loss       /= n_batches
             train_mask_loss  /= n_batches
-            train_depth_loss /= n_batches
+            train_reg_loss /= n_batches
 
         # ================= Validation =================
         pipeline.vae.decoder.eval()
@@ -348,7 +356,7 @@ def train(args):
         print(f"Time           : {epoch_time:.2f}s")
         print(f"Train Loss     : {train_loss:.6f}")
         print(f"  ├─ Mask Loss : {train_mask_loss:.6f}")
-        print(f"  └─ Depth Loss: {train_depth_loss:.6f}")
+        print(f"  └─ Reg Loss: {train_reg_loss:.6f}")
         print(f"Val Loss       : {val_loss:.6f}")
         print(f"Val Dice       : {val_dice:.6f}")
         print(f"Best Val Dice  : {best_dice:.6f}")
@@ -373,7 +381,7 @@ def train(args):
         wandb.log({
             "train/loss_epoch":       train_loss,
             "train/mask_loss_epoch":  train_mask_loss,
-            "train/depth_loss_epoch": train_depth_loss,
+            "train/reg_loss_epoch":   train_reg_loss,
             "val/loss":               val_loss,
             "val/dice":               val_dice,
             "val/best_dice":          best_dice,
@@ -399,6 +407,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_depth", type=float, default=0.3)
     parser.add_argument("--resume_epoch", type=int,   default=0)
     parser.add_argument("--best_dice",    type=float, default=0.0)
+    parser.add_argument("--lambda_reg",   type=float, default=0.1)
  
     args = parser.parse_args()
     os.makedirs(args.output_path, exist_ok=True)

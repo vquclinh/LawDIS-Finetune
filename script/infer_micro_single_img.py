@@ -231,7 +231,7 @@ if "__main__" == __name__:
     )
 
     try:
-        pipe.enable_xformers_memory_efficient_attention()
+      #   pipe.enable_xformers_memory_efficient_attention()
         print("enable_xformers_memory_efficient_attention")
     except ImportError:
         pass  # run without xformers
