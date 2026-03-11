@@ -151,6 +151,12 @@ def train(args):
 
     pipeline = LawDISMacroPipeline.from_pretrained(args.model_path)
     pipeline = pipeline.to(device)
+    
+    if args.resume_epoch > 0:
+        resume_path = os.path.join(args.output_path, f"decoder_epoch_{args.resume_epoch}.pt")
+        state_dict = torch.load(resume_path, map_location=device)
+        pipeline.vae.load_state_dict(state_dict)
+        print(f"Resumed from epoch {args.resume_epoch}: {resume_path}")
 
     # ================= Freeze / Unfreeze =================
     for p in pipeline.unet.parameters():
@@ -200,11 +206,11 @@ def train(args):
     else:
         scale_factor = pipeline.vae.config.scaling_factor
 
-    best_dice   = 0.0
+    best_dice = args.best_dice
     global_step = 0
 
     # ================= Training Loop =================
-    for epoch in range(args.epochs):
+    for epoch in range(args.resume_epoch, args.epochs):
 
         start_time = time.time()
 
@@ -391,7 +397,9 @@ if __name__ == "__main__":
     parser.add_argument("--epochs",       type=int,   default=20)
     parser.add_argument("--lr",           type=float, default=1e-4)
     parser.add_argument("--lambda_depth", type=float, default=0.3)
-
+    parser.add_argument("--resume_epoch", type=int,   default=0)
+    parser.add_argument("--best_dice",    type=float, default=0.0)
+ 
     args = parser.parse_args()
     os.makedirs(args.output_path, exist_ok=True)
     train(args)
