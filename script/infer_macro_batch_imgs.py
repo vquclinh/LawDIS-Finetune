@@ -160,7 +160,6 @@ if "__main__" == __name__:
         print("enable_xformers_memory_efficient_attention")
     except ImportError:
         pass  # run without xformers
-    
 
     pipe = pipe.to(device)
 
@@ -174,36 +173,52 @@ if "__main__" == __name__:
 
     # -------------------- Inference and saving --------------------
     with torch.no_grad():
-        os.makedirs(output_dir, exist_ok=True)
+       os.makedirs(output_dir, exist_ok=True)
 
-        for filename in tqdm(filenames, desc="Estimating dis", leave=True, disable=True):
-            # Read input image
-            rgb_path = os.path.join(input_rgb_dir, filename[0])
-            prompt = filename[1]
-            input_image = Image.open(rgb_path)
-            # Random number generator
-            if seed is None:
-                generator = None
-            else:
-                generator = torch.Generator(device=device)
-                generator.manual_seed(seed)
+       for idx, filename in enumerate(
+           tqdm(filenames, desc="Estimating dis", leave=True, disable=True)
+       ):
+           # Read input image
+           rgb_path = os.path.join(input_rgb_dir, filename[0])
+           prompt = filename[1]
 
-            # Predict dis
-            dis_pred = pipe(
-                input_image,
-                prompt,
-                denoising_steps=denoise_steps,
-                processing_res=processing_res,
-                batch_size=batch_size,
-                show_progress_bar=True,
-                resample_method=resample_method,
-                generator=generator
-            )
 
-            # Save
-            rgb_name_base = os.path.splitext(os.path.basename(rgb_path))[0]
-            dis_to_save = (dis_pred * 255.0).astype(np.uint8)
-            png_save_path = os.path.join(output_dir, f"{rgb_name_base}.png")
-            if os.path.exists(png_save_path):
-                logging.warning(f"Existing file: '{png_save_path}' will be overwritten")
-            Image.fromarray(dis_to_save).save(png_save_path, mode="L")
+           rgb_name_base = os.path.splitext(os.path.basename(rgb_path))[0]
+           png_save_path = os.path.join(output_dir, f"{rgb_name_base}.png")
+
+
+           if os.path.exists(png_save_path):
+               if idx % 10 == 0:
+                   print(f"[SKIP] Image {idx} output already")
+               continue
+          
+           if idx % 5 == 0:
+               print(f"Running {idx}")
+
+           input_image = Image.open(rgb_path)
+
+
+           # Random number generator
+           if seed is None:
+               generator = None
+           else:
+               generator = torch.Generator(device=device)
+               generator.manual_seed(seed)
+
+           # Predict dis
+           dis_pred = pipe(
+               input_image,
+               prompt,
+               denoising_steps=denoise_steps,
+               processing_res=processing_res,
+               batch_size=batch_size,
+               show_progress_bar=True,
+               resample_method=resample_method,
+               generator=generator
+           )
+
+           # Save
+           dis_to_save = (dis_pred * 255.0).astype(np.uint8)
+           if os.path.exists(png_save_path):
+               logging.warning(f"Existing file: '{png_save_path}' will be overwritten")
+           Image.fromarray(dis_to_save).save(png_save_path, mode="L")
