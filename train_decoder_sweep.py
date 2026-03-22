@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 from train_decoder import (
     SegDataset, safe_collate, gradient_map, dice_score,
-    sanitize_features, sanitize_logit
+    sanitize_features, sanitize_logit, combo_loss
 )
 from lawdis.lawdis_macro_pipeline import LawDISMacroPipeline
 from PIL import Image
@@ -19,10 +19,24 @@ Image.MAX_IMAGE_PIXELS = None
 
 load_dotenv("/content/drive/MyDrive/lawdis/.env")
 
+def get_layerwise_params(decoder, post_quant_conv, base_lr, decay=0.1):
+
+    named_params = list(decoder.named_parameters())
+    n = len(named_params)
+    
+    early = [p for _, p in named_params[:n//2]]
+    late  = [p for _, p in named_params[n//2:]]
+
+    return [
+        {"params": early,                          "lr": base_lr * decay},
+        {"params": late,                           "lr": base_lr},
+        {"params": post_quant_conv.parameters(),   "lr": base_lr},
+    ]
+
 # =========================
 # Train for sweep
 # =========================
-def train_sweep(args, trial, lr, lambda_depth, lambda_reg, sweep_epochs=5):
+def train_sweep(args, trial, lr, lambda_depth, lambda_reg, sweep_epochs=3):
 
     wandb.init(
         project=os.getenv("WANDB_PROJECT"),
@@ -75,9 +89,12 @@ def train_sweep(args, trial, lr, lambda_depth, lambda_reg, sweep_epochs=5):
     )
 
     optimizer = optim.Adam(
-        list(pipeline.vae.decoder.parameters()) +
-        list(pipeline.vae.post_quant_conv.parameters()),
-        lr=lr
+        get_layerwise_params(
+           pipeline.vae.decoder,
+           pipeline.vae.post_quant_conv,
+           base_lr=lr,
+           decay=0.1
+        )
     )
 
     AMP_DTYPE = torch.bfloat16
@@ -137,10 +154,11 @@ def train_sweep(args, trial, lr, lambda_depth, lambda_reg, sweep_epochs=5):
                 dy_d = torch.nn.functional.pad(dy_d, (0, 0, 0, 1))
                 boundary_map = (dx_d.abs() + dy_d.abs())
                 boundary_map = boundary_map / (boundary_map.amax(dim=(-2,-1), keepdim=True) + 1e-8)
-                weight = 1.0 + lambda_depth * boundary_map  # vùng rìa có weight cao hơn
+                weight = 1.0 + lambda_depth * boundary_map
 
-                mask_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                    mask_pred, mask_gt, weight=weight.to(mask_pred.dtype)
+                mask_loss = combo_loss(
+                    mask_pred, mask_gt,
+                    weight=weight.to(mask_pred.dtype)
                 )
 
                 reg_loss = torch.stack([
@@ -271,14 +289,16 @@ def train_sweep(args, trial, lr, lambda_depth, lambda_reg, sweep_epochs=5):
 # Optuna Objective
 # =========================
 def objective(trial):
-    lr           = trial.suggest_float("lr", 1e-5, 5e-5, log=True)
-    lambda_depth = trial.suggest_float("lambda_depth", 0.01, 1.0, log=True)
-    lambda_reg   = trial.suggest_float("lambda_reg", 0.01, 1.0, log=True)
-    
-    print(f"\nTrial {trial.number}: lr={lr:.6f}, lambda_depth={lambda_depth:.4f}")
+    lr           = trial.suggest_float("lr", 3e-6, 5e-5, log=True)
+    lambda_depth = trial.suggest_float("lambda_depth", 0.05, 3.0, log=True)
+    lambda_reg   = trial.suggest_float("lambda_reg", 1.0, 20.0, log=True)
+
+    print(f"\nTrial {trial.number}: lr={lr:.2e}, "
+          f"lambda_depth={lambda_depth:.4f}, lambda_reg={lambda_reg:.2f}")
 
     try:
-        best_dice = train_sweep(args, trial, lr, lambda_depth, lambda_reg, sweep_epochs=5)
+        best_dice = train_sweep(args, trial, lr, lambda_depth, lambda_reg,
+                                sweep_epochs=3)
         return best_dice
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
@@ -296,8 +316,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path",  type=str, required=True)
     parser.add_argument("--data_path",   type=str, required=True)
-    parser.add_argument("--image_size",  type=int, default=512)
-    parser.add_argument("--batch_size",  type=int, default=4)
+    parser.add_argument("--image_size",  type=int, default=1024)
+    parser.add_argument("--batch_size",  type=int, default=32)
 
     args = parser.parse_args()
 

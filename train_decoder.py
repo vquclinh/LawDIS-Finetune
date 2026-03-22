@@ -23,8 +23,9 @@ load_dotenv("/content/drive/MyDrive/lawdis/.env")
 # Dataset
 # =========================
 class SegDataset(Dataset):
-    def __init__(self, root_dir, split="DIS-TR", image_size=512, use_depth=False):
-
+    def __init__(self, root_dir, split="DIS-TR", image_size=512,
+                 use_depth=False, augment=False):
+        self.augment   = augment
         self.image_dir = os.path.join(root_dir, "DIS5K", split, "im")
         self.mask_dir  = os.path.join(root_dir, "DIS5K", split, "gt")
 
@@ -53,32 +54,44 @@ class SegDataset(Dataset):
             name = self.images[idx]
             base = os.path.splitext(name)[0]
 
+            # Load PIL images
             img = Image.open(os.path.join(self.image_dir, name))
             img.draft('RGB', (self.image_size, self.image_size))
-            img = img.convert("RGB")
+            img  = img.convert("RGB")
+            mask = Image.open(
+                os.path.join(self.mask_dir, base + ".png")
+            ).convert("L")
 
-            mask = Image.open(os.path.join(self.mask_dir, base + ".png")).convert("L")
+            # Load depth numpy
+            depth_np = None
+            if self.use_depth:
+                depth_pil = Image.open(
+                    os.path.join(self.depth_dir, base + ".png")
+                ).convert("I")
+                depth_pil = depth_pil.resize(
+                    (self.image_size, self.image_size),
+                    Image.Resampling.BILINEAR
+                )
+                depth_np = np.array(depth_pil, dtype=np.float32)
+                if depth_np.max() > 255:
+                    depth_np /= 65535.0
+                else:
+                    depth_np /= 255.0
 
+            if self.augment and torch.rand(1).item() > 0.5:
+                img  = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+                mask = mask.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+                if depth_np is not None:
+                    depth_np = np.fliplr(depth_np).copy()
+
+            # Convert to Tensor
             img  = self.img_tf(img)
             mask = self.mask_tf(mask)
 
             sample = {"image": img, "mask": mask}
 
-            if self.use_depth:
-                depth = Image.open(
-                    os.path.join(self.depth_dir, base + ".png")
-                ).convert("I")
-                depth = depth.resize(
-                    (self.image_size, self.image_size),
-                    Image.Resampling.BILINEAR
-                )
-                depth = np.array(depth, dtype=np.float32)
-                if depth.max() > 255:
-                    depth /= 65535.0
-                else:
-                    depth /= 255.0
-                depth = torch.from_numpy(depth).unsqueeze(0)
-                sample["depth"] = depth
+            if depth_np is not None:
+                sample["depth"] = torch.from_numpy(depth_np).unsqueeze(0)
 
             return sample
 
@@ -106,12 +119,23 @@ def gradient_map(x):
     return dx, dy
 
 
-# [FIX] Soft Dice — not use hard threshold (pred > 0.5)
 def dice_score(pred, target, eps=1e-6):
     pred         = torch.sigmoid(pred)
     intersection = (pred * target).sum(dim=(1, 2, 3))
     union        = pred.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
     return ((2 * intersection + eps) / (union + eps)).mean()
+
+
+def combo_loss(pred_logit, target, weight=None):
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(
+        pred_logit, target, weight=weight
+    )
+    pred_sig = torch.sigmoid(pred_logit)
+    eps    = 1e-6
+    inter  = (pred_sig * target).sum(dim=(1, 2, 3))
+    union  = pred_sig.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+    dice_l = 1.0 - ((2 * inter + eps) / (union + eps)).mean()
+    return bce + dice_l
 
 
 # =========================
@@ -121,13 +145,13 @@ def sanitize_features(rgb_latent, features, latent_clamp=4.0, feat_clamp=10.0):
     rgb_latent = torch.nan_to_num(rgb_latent, nan=0.0,
                                   posinf=latent_clamp, neginf=-latent_clamp)
     rgb_latent = torch.clamp(rgb_latent, -latent_clamp, latent_clamp)
-
     clean = []
     for f in features:
         f = torch.nan_to_num(f, nan=0.0, posinf=feat_clamp, neginf=-feat_clamp)
         f = torch.clamp(f, -feat_clamp, feat_clamp)
         clean.append(f)
     return rgb_latent, clean
+
 
 def sanitize_logit(t, clamp_val=10.0):
     t = torch.nan_to_num(t, nan=-clamp_val, posinf=clamp_val, neginf=-clamp_val)
@@ -136,13 +160,30 @@ def sanitize_logit(t, clamp_val=10.0):
 
 
 # =========================
+# Layer-wise Learning Rate
+# =========================
+def get_layerwise_params(decoder, post_quant_conv, base_lr, decay=0.1):
+    named_params = list(decoder.named_parameters())
+    n = len(named_params)
+
+    early = [p for _, p in named_params[:n//2]]
+    late  = [p for _, p in named_params[n//2:]]
+
+    return [
+        {"params": early,                        "lr": base_lr * decay},
+        {"params": late,                         "lr": base_lr},
+        {"params": post_quant_conv.parameters(), "lr": base_lr},
+    ]
+
+
+# =========================
 # Training
 # =========================
 def train(args):
 
     wandb.init(
-        project="lawdis-decoder",
-        name=f"decoder_lr{args.lr}_ld{args.lambda_depth}",
+        project=os.getenv("WANDB_PROJECT", "lawdis-decoder"),
+        name=f"decoder_lr{args.lr}_ld{args.lambda_depth}_reg{args.lambda_reg}",
         config=vars(args)
     )
 
@@ -151,19 +192,22 @@ def train(args):
 
     pipeline = LawDISMacroPipeline.from_pretrained(args.model_path)
     pipeline = pipeline.to(device)
-    
+
     if args.resume_epoch > 0:
-        resume_path = os.path.join(args.output_path, f"decoder_epoch_{args.resume_epoch}.pt")
+        resume_path = os.path.join(
+            args.output_path, f"decoder_epoch_{args.resume_epoch}.pt"
+        )
         state_dict = torch.load(resume_path, map_location=device)
         pipeline.vae.load_state_dict(state_dict)
         print(f"Resumed from epoch {args.resume_epoch}: {resume_path}")
 
+    # Lưu params gốc để tính reg loss (chống catastrophic forgetting)
     original_params = {
         name: param.clone().detach()
         for name, param in pipeline.vae.decoder.named_parameters()
     }
 
-    # ================= Freeze / Unfreeze =================
+    # ── Freeze / Unfreeze ────────────────────────────────────────────
     for p in pipeline.unet.parameters():
         p.requires_grad = False
     for p in pipeline.vae.encoder.parameters():
@@ -178,31 +222,45 @@ def train(args):
     pipeline.vae.decoder.train()
     pipeline.vae.post_quant_conv.train()
 
-    # ================= Dataset =================
-    train_dataset = SegDataset(args.data_path, "DIS-TR", args.image_size, use_depth=True)
-    val_dataset   = SegDataset(args.data_path, "DIS-VD", args.image_size, use_depth=False)
+    # Dataset
+    train_dataset = SegDataset(
+        args.data_path, "DIS-TR", args.image_size,
+        use_depth=True,  augment=True
+    )
+    val_dataset = SegDataset(
+        args.data_path, "DIS-VD", args.image_size,
+        use_depth=False, augment=False
+    )
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=2, pin_memory=True, persistent_workers=True,
+        num_workers=4, pin_memory=True, persistent_workers=True,
         collate_fn=safe_collate
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=2, pin_memory=True, persistent_workers=True,
+        num_workers=4, pin_memory=True, persistent_workers=True,
         collate_fn=safe_collate
     )
 
-    print(f"Train images: {len(train_dataset)}")
-    print(f"Val images  : {len(val_dataset)}")
+    print(f"Train images : {len(train_dataset)}")
+    print(f"Val images   : {len(val_dataset)}")
 
+    # Optimizer + Scheduler
     optimizer = optim.Adam(
-        list(pipeline.vae.decoder.parameters()) +
-        list(pipeline.vae.post_quant_conv.parameters()),
-        lr=args.lr
+        get_layerwise_params(
+            pipeline.vae.decoder,
+            pipeline.vae.post_quant_conv,
+            base_lr=args.lr,
+            decay=0.1
+        )
     )
 
-    bce = nn.BCEWithLogitsLoss()
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+        eta_min=args.lr * 0.01
+    )
 
     AMP_DTYPE = torch.bfloat16
 
@@ -211,24 +269,24 @@ def train(args):
     else:
         scale_factor = pipeline.vae.config.scaling_factor
 
-    best_dice = args.best_dice
+    best_dice   = args.best_dice
     global_step = 0
 
-    # ================= Training Loop =================
+    # Training Loop
     for epoch in range(args.resume_epoch, args.epochs):
 
         start_time = time.time()
 
-        train_loss       = 0.0
-        train_mask_loss  = 0.0
-        train_reg_loss = 0.0
-        n_batches        = 0
-        n_skipped        = 0
+        train_loss      = 0.0
+        train_mask_loss = 0.0
+        train_reg_loss  = 0.0
+        n_batches       = 0
+        n_skipped       = 0
 
         pipeline.vae.decoder.train()
         pipeline.vae.post_quant_conv.train()
 
-        for batch in tqdm(train_loader, desc=f"Train Epoch {epoch+1}"):
+        for batch in tqdm(train_loader, desc=f"Train Epoch {epoch+1}/{args.epochs}"):
 
             if batch is None:
                 continue
@@ -249,19 +307,23 @@ def train(args):
                 mask_pred = pipeline.vae.decoder(z, features)
                 mask_pred = sanitize_logit(mask_pred)
 
+                # Depth boundary weight
                 depth_n = depth.float()
-                depth_n = depth_n - depth_n.amin(dim=(-2,-1), keepdim=True)
-                depth_n = depth_n / (depth_n.amax(dim=(-2,-1), keepdim=True) + 1e-8)
+                depth_n = depth_n - depth_n.amin(dim=(-2, -1), keepdim=True)
+                depth_n = depth_n / (depth_n.amax(dim=(-2, -1), keepdim=True) + 1e-8)
 
                 dx_d, dy_d = gradient_map(depth_n)
                 dx_d = torch.nn.functional.pad(dx_d, (0, 1, 0, 0))
                 dy_d = torch.nn.functional.pad(dy_d, (0, 0, 0, 1))
-                boundary_map = (dx_d.abs() + dy_d.abs())
-                boundary_map = boundary_map / (boundary_map.amax(dim=(-2,-1), keepdim=True) + 1e-8)
+                boundary_map = dx_d.abs() + dy_d.abs()
+                boundary_map = boundary_map / (
+                    boundary_map.amax(dim=(-2, -1), keepdim=True) + 1e-8
+                )
                 weight = 1.0 + args.lambda_depth * boundary_map
 
-                mask_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-                    mask_pred, mask_gt, weight=weight.to(mask_pred.dtype)
+                mask_loss = combo_loss(
+                    mask_pred, mask_gt,
+                    weight=weight.to(mask_pred.dtype)
                 )
 
                 reg_loss = torch.stack([
@@ -279,8 +341,6 @@ def train(args):
                 n_skipped += 1
                 continue
 
-            # Not use scaler.scale(loss).backward()
-            # bf16 not need loss scaling → backward 
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
@@ -299,24 +359,27 @@ def train(args):
             optimizer.step()
 
             wandb.log({
-                "train/loss_step":       loss.item(),
-                "train/mask_loss_step":  mask_loss.item(),
-                "train/reg_loss_step":   reg_loss.item(),
-                "train/grad_norm":       total_norm,
+                "train/loss_step":      loss.item(),
+                "train/mask_loss_step": mask_loss.item(),
+                "train/reg_loss_step":  reg_loss.item(),
+                "train/grad_norm":      total_norm,
             }, step=global_step)
 
-            global_step      += 1
-            train_loss       += loss.item()
-            train_mask_loss  += mask_loss.item()
-            train_reg_loss   += reg_loss.item()
-            n_batches        += 1
+            global_step     += 1
+            train_loss      += loss.item()
+            train_mask_loss += mask_loss.item()
+            train_reg_loss  += reg_loss.item()
+            n_batches       += 1
 
         if n_batches > 0:
-            train_loss       /= n_batches
-            train_mask_loss  /= n_batches
-            train_reg_loss /= n_batches
+            train_loss      /= n_batches
+            train_mask_loss /= n_batches
+            train_reg_loss  /= n_batches
 
-        # ================= Validation =================
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
+        # Validation
         pipeline.vae.decoder.eval()
         pipeline.vae.post_quant_conv.eval()
 
@@ -341,7 +404,10 @@ def train(args):
                     mask_pred = pipeline.vae.decoder(z, features)
                     mask_pred = sanitize_logit(mask_pred)
 
-                    val_loss += bce(mask_pred, mask_gt).item()
+                    # Val loss dùng BCE thuần để đánh giá khách quan
+                    val_loss += torch.nn.functional.binary_cross_entropy_with_logits(
+                        mask_pred, mask_gt
+                    ).item()
                     val_dice += dice_score(mask_pred, mask_gt).item()
                     n_val_batches += 1
 
@@ -351,17 +417,17 @@ def train(args):
 
         epoch_time = time.time() - start_time
 
-        print("\n==============================")
-        print(f"Epoch {epoch+1}/{args.epochs}")
-        print(f"Time           : {epoch_time:.2f}s")
-        print(f"Train Loss     : {train_loss:.6f}")
-        print(f"  ├─ Mask Loss : {train_mask_loss:.6f}")
-        print(f"  └─ Reg Loss: {train_reg_loss:.6f}")
-        print(f"Val Loss       : {val_loss:.6f}")
-        print(f"Val Dice       : {val_dice:.6f}")
-        print(f"Best Val Dice  : {best_dice:.6f}")
-        print(f"Skipped batches: {n_skipped}")
-        print("==============================\n")
+        print("\n" + "="*50)
+        print(f"Epoch {epoch+1}/{args.epochs}  |  Time: {epoch_time:.2f}s")
+        print(f"  Train Loss     : {train_loss:.6f}")
+        print(f"    ├─ Mask Loss : {train_mask_loss:.6f}")
+        print(f"    └─ Reg Loss  : {train_reg_loss:.6f}")
+        print(f"  Val Loss       : {val_loss:.6f}")
+        print(f"  Val Dice       : {val_dice:.6f}")
+        print(f"  Best Val Dice  : {best_dice:.6f}")
+        print(f"  Current LR     : {current_lr:.2e}")
+        print(f"  Skipped        : {n_skipped} batches")
+        print("="*50 + "\n")
 
         torch.save(
             pipeline.vae.state_dict(),
@@ -376,19 +442,21 @@ def train(args):
             )
             if wandb.run is not None:
                 wandb.run.summary["best_val_dice"] = val_dice
-            print("New BEST model saved!\n")
+            print("✅ New BEST model saved!\n")
 
         wandb.log({
-            "train/loss_epoch":       train_loss,
-            "train/mask_loss_epoch":  train_mask_loss,
-            "train/reg_loss_epoch":   train_reg_loss,
-            "val/loss":               val_loss,
-            "val/dice":               val_dice,
-            "val/best_dice":          best_dice,
-            "train/skipped_batches":  n_skipped,
+            "train/loss_epoch":      train_loss,
+            "train/mask_loss_epoch": train_mask_loss,
+            "train/reg_loss_epoch":  train_reg_loss,
+            "train/lr":              current_lr,
+            "val/loss":              val_loss,
+            "val/dice":              val_dice,
+            "val/best_dice":         best_dice,
+            "train/skipped_batches": n_skipped,
         }, step=global_step)
 
     wandb.finish()
+    print("Training complete.")
 
 
 # =========================
@@ -400,15 +468,15 @@ if __name__ == "__main__":
     parser.add_argument("--model_path",   type=str,   required=True)
     parser.add_argument("--data_path",    type=str,   required=True)
     parser.add_argument("--output_path",  type=str,   default="./checkpoints")
-    parser.add_argument("--image_size",   type=int,   default=512)
-    parser.add_argument("--batch_size",   type=int,   default=4)
+    parser.add_argument("--image_size",   type=int,   default=1024)
+    parser.add_argument("--batch_size",   type=int,   default=32)
     parser.add_argument("--epochs",       type=int,   default=20)
-    parser.add_argument("--lr",           type=float, default=1e-4)
+    parser.add_argument("--lr",           type=float, default=3e-5)
     parser.add_argument("--lambda_depth", type=float, default=0.3)
+    parser.add_argument("--lambda_reg",   type=float, default=5.0)
     parser.add_argument("--resume_epoch", type=int,   default=0)
     parser.add_argument("--best_dice",    type=float, default=0.0)
-    parser.add_argument("--lambda_reg",   type=float, default=0.1)
- 
+
     args = parser.parse_args()
     os.makedirs(args.output_path, exist_ok=True)
     train(args)
