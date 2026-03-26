@@ -201,8 +201,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_epochs", type=int, default=15)
     parser.add_argument("--learning_rate", type=float, default=3e-5)
     parser.add_argument("--data_root", type=str, default="data")
-    parser.add_argument("--output_dir", type=str, default="checkpoints", help="Thư mục lưu model")
-    parser.add_argument("--model_path", type=str, default="pretrained_model", help="Đường dẫn tới thư mục chứa SDv2 offline")
-    
+    parser.add_argument("--output_dir", type=str, default="checkpoints")
+    parser.add_argument("--model_path", type=str, default="pretrained_model")
+    parser.add_argument("--resume_from", type=str, default=None)
+
     args = parser.parse_args()
     train_guidance_model(args)
