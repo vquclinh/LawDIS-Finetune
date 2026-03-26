@@ -12,6 +12,9 @@ from diffusers import AutoencoderKL, DDPMScheduler
 from tqdm.auto import tqdm
 import random
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 # ==========================================
 # 1. DATASET & DATALOADER
 # ==========================================
@@ -116,18 +119,16 @@ def train_guidance_model(args):
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Load từ local path (pretrained_model) để tiết kiệm thời gian tải trên Colab
     print(f"Loading VAE and Scheduler from {args.model_path}...")
     vae = AutoencoderKL.from_pretrained(args.model_path, subfolder="vae").to(device)
+    vae = vae.to(memory_format=torch.channels_last)
     noise_scheduler = DDPMScheduler.from_pretrained(args.model_path, subfolder="scheduler")
-    
-    vae.enable_slicing()
     
     vae.eval()
     vae.requires_grad_(False) 
 
     print("Initializing LatentDepthPredictor...")
-    f_phi = LatentDepthPredictor().to(device)
+    f_phi = LatentDepthPredictor().to(device).to(memory_format=torch.channels_last)
 
     start_epoch = 0
     if args.resume_from and os.path.exists(args.resume_from):
@@ -146,37 +147,41 @@ def train_guidance_model(args):
     optimizer = torch.optim.AdamW(f_phi.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     
     dataset = DIS5KDepthDataset(data_root=args.data_root, size=1024)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    
-    print(f"Bắt đầu Training! Số lượng ảnh: {len(dataset)}")
-    print(f"Config: Epochs={args.num_epochs}, Batch Size={args.batch_size}, LR={args.learning_rate}")
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True, 
+        num_workers=8,
+        pin_memory=True, 
+        prefetch_factor=2
+    )
     
     best_loss = float('inf')
     
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
         epoch_loss = 0.0
         
         for batch in progress_bar:
-            image = batch["image"].to(device)
-            mask = batch["mask"].to(device)
-            depth = batch["depth"].to(device)
+            image = batch["image"].to(device, memory_format=torch.channels_last)
+            mask = batch["mask"].to(device, memory_format=torch.channels_last)
+            depth = batch["depth"].to(device, memory_format=torch.channels_last)
             
-            with torch.no_grad():
-                latent_img = encode_to_latent(vae, image)
-                latent_mask = encode_to_latent(vae, mask)
-                latent_depth = encode_to_latent(vae, depth) 
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                with torch.no_grad():
+                    latent_img = encode_to_latent(vae, image)
+                    latent_mask = encode_to_latent(vae, mask)
+                    latent_depth = encode_to_latent(vae, depth) 
+                
+                noise = torch.randn_like(latent_mask)
+                bsz = latent_mask.shape[0]
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=device).long()
+                z_t = noise_scheduler.add_noise(latent_mask, noise, timesteps)
+                
+                pred_depth_latent = f_phi(z_t, latent_img, timesteps)
+                loss = F.mse_loss(pred_depth_latent, latent_depth)
             
-            noise = torch.randn_like(latent_mask)
-            bsz = latent_mask.shape[0]
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=device).long()
-            z_t = noise_scheduler.add_noise(latent_mask, noise, timesteps)
-            
-            optimizer.zero_grad()
-            pred_depth_latent = f_phi(z_t, latent_img, timesteps)
-            
-            loss = F.mse_loss(pred_depth_latent, latent_depth)
-            
+            optimizer.zero_grad(set_to_none=True) # Tiết kiệm VRAM hơn zero_grad()
             loss.backward()
             optimizer.step()
             
