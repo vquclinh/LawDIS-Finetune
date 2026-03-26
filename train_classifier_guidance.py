@@ -121,11 +121,26 @@ def train_guidance_model(args):
     vae = AutoencoderKL.from_pretrained(args.model_path, subfolder="vae").to(device)
     noise_scheduler = DDPMScheduler.from_pretrained(args.model_path, subfolder="scheduler")
     
+    vae.enable_slicing()
+    
     vae.eval()
     vae.requires_grad_(False) 
 
     print("Initializing LatentDepthPredictor...")
     f_phi = LatentDepthPredictor().to(device)
+
+    start_epoch = 0
+    if args.resume_from and os.path.exists(args.resume_from):
+        print(f"🔄 Đang load trọng số cũ từ: {args.resume_from} để train tiếp...")
+        f_phi.load_state_dict(torch.load(args.resume_from))
+        
+        try:
+            filename = os.path.basename(args.resume_from)
+            start_epoch = int(filename.split('_')[-1].split('.')[0])
+            print(f"Sẽ bắt đầu train tiếp từ Epoch {start_epoch + 1}")
+        except:
+            print("Không xác định được số epoch cũ, bắt đầu tính từ 1 nhưng dùng trọng số cũ.")
+
     f_phi.train()
     
     optimizer = torch.optim.AdamW(f_phi.parameters(), lr=args.learning_rate, weight_decay=1e-4)
