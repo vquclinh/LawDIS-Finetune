@@ -11,7 +11,6 @@ from torchvision import transforms
 from diffusers import AutoencoderKL, DDPMScheduler
 from tqdm.auto import tqdm
 import random
-import torchvision.transforms.functional as TF
 
 # ==========================================
 # 1. DATASET & DATALOADER
@@ -117,9 +116,10 @@ def train_guidance_model(args):
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    print("Loading VAE and Scheduler...")
-    vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2", subfolder="vae").to(device)
-    noise_scheduler = DDPMScheduler.from_pretrained("stabilityai/stable-diffusion-2", subfolder="scheduler")
+    # Load từ local path (pretrained_model) để tiết kiệm thời gian tải trên Colab
+    print(f"Loading VAE and Scheduler from {args.model_path}...")
+    vae = AutoencoderKL.from_pretrained(args.model_path, subfolder="vae").to(device)
+    noise_scheduler = DDPMScheduler.from_pretrained(args.model_path, subfolder="scheduler")
     
     vae.eval()
     vae.requires_grad_(False) 
@@ -135,6 +135,8 @@ def train_guidance_model(args):
     
     print(f"Bắt đầu Training! Số lượng ảnh: {len(dataset)}")
     print(f"Config: Epochs={args.num_epochs}, Batch Size={args.batch_size}, LR={args.learning_rate}")
+    
+    best_loss = float('inf')
     
     for epoch in range(args.num_epochs):
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.num_epochs}")
@@ -171,14 +173,21 @@ def train_guidance_model(args):
         
         save_path = os.path.join(args.output_dir, f"f_phi_epoch_{epoch+1}.pth")
         torch.save(f_phi.state_dict(), save_path)
+        
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_save_path = os.path.join(args.output_dir, "best_f_phi.pth")
+            torch.save(f_phi.state_dict(), best_save_path)
+            print(f"Đã cập nhật best_checkpoint với loss kỷ lục mới: {best_loss:.4f}!")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Latent Depth Predictor for LawDIS Guidance")
-    parser.add_argument("--batch_size", type=int, default=8, help="Kích thước batch size")
-    parser.add_argument("--num_epochs", type=int, default=15, help="Số lượng epoch cần train")
-    parser.add_argument("--learning_rate", type=float, default=3e-5, help="Learning rate")
-    parser.add_argument("--data_root", type=str, default="data", help="Thư mục chứa data")
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--num_epochs", type=int, default=15)
+    parser.add_argument("--learning_rate", type=float, default=3e-5)
+    parser.add_argument("--data_root", type=str, default="data")
     parser.add_argument("--output_dir", type=str, default="checkpoints", help="Thư mục lưu model")
+    parser.add_argument("--model_path", type=str, default="pretrained_model", help="Đường dẫn tới thư mục chứa SDv2 offline")
     
     args = parser.parse_args()
     train_guidance_model(args)
